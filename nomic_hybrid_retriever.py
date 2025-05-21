@@ -1,14 +1,18 @@
 from __future__ import annotations
-from typing import List, Optional, Union
-
+import math
+from typing import List, Optional, Union, cast
 import torch
 from PIL import Image
 import pytesseract
 from nomic import embed
-
+from tqdm import tqdm
+from torch import Tensor
+import torch.nn.functional as F
 from vidore_benchmark.retrievers.base_vision_retriever import BaseVisionRetriever
 from vidore_benchmark.retrievers.registry_utils import register_vision_retriever
-
+from vidore_benchmark.utils.iter_utils import batched
+from vidore_benchmark.utils.torch_utils import get_torch_device
+from transformers import AutoTokenizer, AutoModel, AutoImageProcessor 
 
 @register_vision_retriever("nomic_hybrid_retriever")
 class NomicHybridRetriever(BaseVisionRetriever):
@@ -21,16 +25,19 @@ class NomicHybridRetriever(BaseVisionRetriever):
     def __init__(
         self,
         alpha: float = 0.5,
-        text_model: str = "nomic-embed-text-v1.5",
-        image_model: str = "nomic-embed-vision-v1.5",
-        device: str = "cpu",
+        device: str = "auto",
         **kwargs,
     ):
         super().__init__(use_visual_embedding=True)
         self.alpha = alpha
-        self.text_model = text_model
-        self.image_model = image_model
-        self.device = device
+
+        self.image_processor = AutoImageProcessor.from_pretrained("nomic-ai/nomic-embed-vision-v1.5")
+        self.vision_model = AutoModel.from_pretrained("nomic-ai/nomic-embed-vision-v1.5",trust_remote_code = True)
+
+        self.tokenizer = AutoTokenizer.from_pretrained('nomic-ai/nomic-embed-text-v1.5')
+        self.text_model = AutoModel.from_pretrained('nomic-ai/nomic-embed-text-v1.5',trust_remote_code=True)
+        
+        self.device = get_torch_device(device)
 
     def forward_queries(
         self,
@@ -38,15 +45,40 @@ class NomicHybridRetriever(BaseVisionRetriever):
         batch_size: int,
         **kwargs,
     ) -> torch.Tensor:
-        # Embedding textuel des queries
-        # nomic.embed.text renvoie List[List[float]]
-        text_embs = embed.text(
-            texts=queries,
-            model=self.text_model,
-            task_type="search_query"
-        )
-        tensor = torch.tensor(text_embs, dtype=torch.float32, device=self.device)
-        return tensor
+        
+        list_emb_queries: List[torch.Tensor] = []
+        for query_batch in tqdm(
+            batched(queries, batch_size),
+            desc="Forwarding query batches",
+            total=math.ceil(len(queries) / batch_size),
+            leave=False,
+        ):
+            query_batch = cast(List[str], query_batch)
+
+            query_texts = ["search_query: " + query for query in query_batch]
+            encoded_input = self.tokenizer(
+                query_texts,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            ).to(self.device)
+
+            with torch.no_grad():
+                qs = self.text_model(**encoded_input)
+                qs = self._mean_pooling(qs, encoded_input["attention_mask"])
+                qs = F.layer_norm(qs, normalized_shape=(qs.shape[1],))
+                qs = F.normalize(qs, p=2, dim=1)
+
+            query_embeddings = torch.tensor(qs).to(self.device)
+            list_emb_queries.extend(list(torch.unbind(query_embeddings, dim=0)))
+
+        return list_emb_queries
+
+    @staticmethod
+    def _mean_pooling(model_output: Tensor, attention_mask: Tensor) -> Tensor:
+        token_embeddings = model_output[0]
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
     def forward_passages(
         self,
@@ -54,27 +86,7 @@ class NomicHybridRetriever(BaseVisionRetriever):
         batch_size: int,
         **kwargs,
     ) -> List[torch.Tensor]:
-        # 1) OCR pour extraire le texte de chaque page
-        docs_text = [pytesseract.image_to_string(img) for img in passages]
-
-        # 2) Embedding texte
-        text_embs = embed.text(
-            texts=docs_text,
-            model=self.text_model,
-            task_type="search_document"
-        )
-        text_tensor = torch.tensor(text_embs, dtype=torch.float32, device=self.device)
-
-        # 3) Embedding image
-        # nomic.embed.image accepte les PIL.Image
-        image_embs = embed.image(
-            images=passages,
-            model=self.image_model
-        )
-        image_tensor = torch.tensor(image_embs, dtype=torch.float32, device=self.device)
-
-        # On renvoie les deux matrices d'embeddings
-        return [text_tensor, image_tensor]
+        
 
     def get_scores(
         self,
@@ -82,12 +94,4 @@ class NomicHybridRetriever(BaseVisionRetriever):
         passage_embeddings: Union[torch.Tensor, List[torch.Tensor]],
         batch_size: Optional[int] = None,
     ) -> torch.Tensor:
-        # récupère les deux embeddings de passages
-        text_tensor, image_tensor = passage_embeddings
-        # calcul des similarités dot-product
-        # query_embeddings : [nq, d], text_tensor/image_tensor : [nd, d]
-        scores_text  = torch.matmul(query_embeddings, text_tensor.T)
-        scores_image = torch.matmul(query_embeddings, image_tensor.T)
-        # fusion
-        scores = self.alpha * scores_text + (1.0 - self.alpha) * scores_image
-        return scores
+         
