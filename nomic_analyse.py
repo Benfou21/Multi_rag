@@ -1,0 +1,120 @@
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel, AutoImageProcessor
+from datasets import load_dataset
+from PIL import Image
+from doclayout_yolo import YOLOv10
+from huggingface_hub import hf_hub_download
+import pytesseract
+import matplotlib.pyplot as plt
+
+# --- Configuration ---
+DATASET = "nielsr/vitore_benchmark"
+SPLIT = "test"
+BATCH_SIZE = 8
+TOP_K = 5  # number of top results to inspect
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- Load Models ---
+tokenizer = AutoTokenizer.from_pretrained("nomic-ai/nomic-embed-text-v1.5")
+text_model = AutoModel.from_pretrained("nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True).to(DEVICE)
+
+image_processor = AutoImageProcessor.from_pretrained("nomic-ai/nomic-embed-vision-v1.5")
+vision_model = AutoModel.from_pretrained("nomic-ai/nomic-embed-vision-v1.5", trust_remote_code=True).to(DEVICE)
+
+# YOLO detector for layout (figures and tables)
+model_path = hf_hub_download(repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
+                             filename="doclayout_yolo_docstructbench_imgsz1024.pt")
+yolo = YOLOv10(model_path)
+
+# --- Helper Functions ---
+def mean_pooling(outputs, mask):
+    tokens = outputs.last_hidden_state
+    mask = mask.unsqueeze(-1).expand(tokens.size()).float()
+    return torch.sum(tokens * mask, dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+
+
+def embed_texts(texts):
+    enc = tokenizer(texts, padding=True, truncation=True, return_tensors='pt').to(DEVICE)
+    with torch.no_grad():
+        out = text_model(**enc)
+        pooled = mean_pooling(out, enc.attention_mask)
+        emb = F.normalize(F.layer_norm(pooled, pooled.shape[-1:]), p=2)
+    return emb.cpu()
+
+
+def extract_crops(image):
+    det = yolo.predict(image, imgsz=1024, conf=0.2, device=DEVICE)
+    crops = []
+    if det and det[0].boxes:
+        for box in det[0].boxes:
+            cls = yolo.names[int(box.cls[0])]
+            if cls in ['figure', 'table']:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                crops.append(image.crop((x1, y1, x2, y2)))
+    return crops or [image]
+
+
+def embed_image(image):
+    # OCR text + vision
+    text = pytesseract.image_to_string(image)
+    text_emb = embed_texts([text])[0] if text.strip() else torch.zeros(text_model.config.hidden_size)
+
+    crops = extract_crops(image)
+    imgs = [c.convert('RGB') for c in crops]
+    proc = image_processor(images=imgs, return_tensors='pt').to(DEVICE)
+    with torch.no_grad():
+        out = vision_model(**proc)
+        vis_feats = out.last_hidden_state.mean(1)
+        vis_embs = F.normalize(F.layer_norm(vis_feats, vis_feats.shape[-1:]), p=2)
+    # combine text and all crops by max pooling
+    all_embs = torch.vstack([text_emb.unsqueeze(0), vis_embs.cpu()])
+    return all_embs
+
+
+def retrieve_topk(query_emb, corpus_embs, k):
+    sims = [F.cosine_similarity(query_emb.unsqueeze(0), doc_embs, dim=1).max().item()
+            for doc_embs in corpus_embs]
+    ranked = sorted(enumerate(sims), key=lambda x: x[1], reverse=True)
+    return ranked[:k]
+
+
+def analyze_failures(queries, qrels, corpus_images, corpus_embs, k=TOP_K):
+    for qi, q in enumerate(queries):
+        print(f"\nQuery {qi}: {q}")
+        top = retrieve_topk(query_embs[qi], corpus_embs, k)
+        gold = set(qrels.get(qi, []))
+        print(f"  Relevant docs: {gold}")
+        for rank, (doc_id, score) in enumerate(top, 1):
+            flag = '✔' if doc_id in gold else '✖'
+            print(f"  {rank}. Doc {doc_id} (score: {score:.3f}) {flag}")
+            img = corpus_images[doc_id]
+            plt.figure(figsize=(4,4))
+            plt.imshow(img); plt.axis('off')
+        input("Press Enter for next query...")
+
+# --- Main Script ---
+if __name__ == '__main__':
+    # 1. Load dataset
+    ds_c = load_dataset(DATASET, name='corpus', split=SPLIT)
+    ds_q = load_dataset(DATASET, name='queries', split=SPLIT)
+    ds_r = load_dataset(DATASET, name='qrels', split=SPLIT)
+
+    corpus_images = [ex['image'] for ex in ds_c]
+    queries = [ex['query'] for ex in ds_q]
+    qrels = {ex['query-id']: [] for ex in ds_r}
+    for ex in ds_r:
+        qrels.setdefault(ex['query-id'], []).append(ex['corpus-id'])
+
+    # 2. Embed corpus
+    print("Embedding corpus...")
+    corpus_embs = []
+    for img in corpus_images:
+        corpus_embs.append(embed_image(img))
+
+    # 3. Embed queries
+    print("Embedding queries...")
+    query_embs = embed_texts(queries)
+
+    # 4. Analyze failures
+    analyze_failures(queries, qrels, corpus_images, corpus_embs)
