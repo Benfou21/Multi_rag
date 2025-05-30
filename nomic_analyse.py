@@ -79,7 +79,7 @@ def retrieve_topk(query_emb, corpus_embs, k):
     return ranked[:k]
 
 
-def analyze_failures(queries, qrels, corpus_images, corpus_embs, k=TOP_K):
+def analyze_failures(queries, qrels,ds_c, corpus_embs, k=TOP_K):
     for qi, q in enumerate(queries):
         print(f"\nQuery {qi}: {q}")
         top = retrieve_topk(query_embs[qi], corpus_embs, k)
@@ -88,7 +88,7 @@ def analyze_failures(queries, qrels, corpus_images, corpus_embs, k=TOP_K):
         for rank, (doc_id, score) in enumerate(top, 1):
             flag = '✔' if doc_id in gold else '✖'
             print(f"  {rank}. Doc {doc_id} (score: {score:.3f}) {flag}")
-            img = corpus_images[doc_id]
+            img = ds_c[doc_id]["image"]
             plt.figure(figsize=(4,4))
             plt.imshow(img); plt.axis('off')
         input("Press Enter for next query...")
@@ -100,21 +100,31 @@ if __name__ == '__main__':
     ds_q = load_dataset(DATASET, name='queries', split=SPLIT)
     ds_r = load_dataset(DATASET, name='qrels', split=SPLIT)
 
-    corpus_images = [ex['image'] for ex in ds_c]
     queries = [ex['query'] for ex in ds_q]
     qrels = {ex['query-id']: [] for ex in ds_r}
     for ex in ds_r:
         qrels.setdefault(ex['query-id'], []).append(ex['corpus-id'])
 
+
+    
     # 2. Embed corpus
     print("Embedding corpus...")
-    corpus_embs = []
-    for img in corpus_images:
-        corpus_embs.append(embed_image(img))
-
+    all_passages_embs: List[Tensor] = []
+    num_corpus_docs = len(ds_c)
+  
+    print(f"\nEncoding pages...")
+    for i in tqdm(range(0, num_corpus_docs, corpus_processing_batch_size), desc="Corpus Encoding Batches"):
+        batch_start = i
+        batch_end = min(i + corpus_processing_batch_size, num_corpus_docs)
+            
+        current_batch_dataset_slice = ds_c.select(range(batch_start, batch_end))
+        current_batch_images: List[Image.Image] = [ex['image'] for ex in current_batch_dataset_slice]
+        all_passages_embs.append(embed_image(current_batch_images))
+    
+    
     # 3. Embed queries
     print("Embedding queries...")
     query_embs = embed_texts(queries)
 
     # 4. Analyze failures
-    analyze_failures(queries, qrels, corpus_images, corpus_embs)
+    analyze_failures(queries, qrels, ds_c, corpus_embs)
