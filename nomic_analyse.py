@@ -28,6 +28,47 @@ model_path = hf_hub_download(repo_id="juliozhao/DocLayout-YOLO-DocStructBench",
 yolo = YOLOv10(model_path)
 
 # --- Helper Functions ---
+
+import sys
+def islice(iterable, *args):
+    """
+    Yield a slice of an iterable.
+    >>> islice('ABCDEFG', 2) → A B
+    >>> islice('ABCDEFG', 2, 4) → C D
+    >>> islice('ABCDEFG', 2, None) → C D E F G
+    >>> islice('ABCDEFG', 0, None, 2) → A C E G
+    """
+    s = slice(*args)
+    start, stop, step = s.start or 0, s.stop or sys.maxsize, s.step or 1
+    it = iter(range(start, stop, step))
+    try:
+        nexti = next(it)
+    except StopIteration:
+        # Consume *iterable* up to the *start* position.
+        for i, element in zip(range(start), iterable):
+            pass
+        return
+    try:
+        for i, element in enumerate(iterable):
+            if i == nexti:
+                yield element
+                nexti = next(it)
+    except StopIteration:
+        # Consume to *stop*.
+        for i, element in zip(range(i + 1, stop), iterable):
+            pass
+
+def batched(iterable, n: int):
+    """
+    Yield batches of n elements from an iterable.
+    >>> batched('ABCDEFG', 3) → ABC DEF G
+    """
+    if n < 1:
+        raise ValueError("n must be at least one")
+    it = iter(iterable)
+    while batch := tuple(islice(it, n)):
+        yield batch
+
 def mean_pooling(outputs, mask):
     tokens = outputs.last_hidden_state
     mask = mask.unsqueeze(-1).expand(tokens.size()).float()
@@ -89,10 +130,10 @@ def forward_passages(
 
                 enc = tokenizer(
                     list(text_batch), padding=True, truncation=True, return_tensors="pt", max_length=8192 # Nomic max length
-                ).to(device)
+                ).to(DEVICE)
                 with torch.no_grad():
                     out = text_model(**enc)
-                    pooled = _mean_pooling(out, enc["attention_mask"])
+                    pooled = mean_pooling(out, enc["attention_mask"])
                     pooled = F.layer_norm(pooled, normalized_shape=(pooled.shape[1],), eps=1e-7)
                     pooled = F.normalize(pooled, p=2, dim=1)
                 text_embs.extend(torch.unbind(pooled.cpu(), dim=0))
@@ -107,8 +148,8 @@ def forward_passages(
         vision_model.eval() 
 
         for page in tqdm(passages, desc="Layout extracation page images", leave=False):
-            det = layout_model.predict(
-                page, imgsz=1024, conf=0.2, device=device
+            det = yolo.predict(
+                page, imgsz=1024, conf=0.2, device=DEVICE
             )
             crops: List[Image.Image] = []
             if det and len(det[0].boxes) > 0:
@@ -118,13 +159,12 @@ def forward_passages(
                     x2 = min(page.width, x2)
                     y2 = min(page.height, y2)
                     class_id = int(box.cls[0])
-                    class_name = layout_model.names[class_id]
+                    class_name = yolo.names[class_id]
 
                     #En pure mode on prend chaque layout en image sinon que les diagrame
                     if pure or class_name in ["figure","table"]:
                         crops.append(page.crop((x1, y1, x2, y2)))
-                        plt.imshow(page.crop((x1, y1, x2, y2)))
-                        plt.show()
+                        
 
             # Si pas de diagramme détecté, fallback sur la page entière
             if len(crops) == 0:
@@ -148,7 +188,7 @@ def forward_passages(
             # Process image crops and get embeddings
             proc = image_processor(
                 images=rgb_page_crops, return_tensors="pt"
-            ).to(device)
+            ).to(DEVICE)
 
             with torch.no_grad():
                 out = vision_model(**proc)
@@ -187,15 +227,30 @@ def forward_passages(
 
         return final_page_embeddings
 
+# def retrieve_topk(query_emb, corpus_embs, k):
+#     sims = [F.cosine_similarity(query_emb.unsqueeze(0), doc_embs, dim=1).max().item()
+#             for doc_embs in corpus_embs]
+#     ranked = sorted(enumerate(sims), key=lambda x: x[1], reverse=True)
+#     return ranked[:k]
 
 def retrieve_topk(query_emb, corpus_embs, k):
-    sims = [F.cosine_similarity(query_emb.unsqueeze(0), doc_embs, dim=1).max().item()
-            for doc_embs in corpus_embs]
+    sims = []
+    for doc_embs_list in corpus_embs: 
+        if not doc_embs_list: 
+            sims.append(-1.0) 
+            continue
+        stacked_doc_embs = torch.stack(doc_embs_list).to(query_emb.device)
+
+        similarities_for_doc = F.cosine_similarity(query_emb.unsqueeze(0), stacked_doc_embs, dim=1)
+        
+        # Take the maximum similarity for this document
+        max_sim = similarities_for_doc.max().item()
+        sims.append(max_sim)
+        
     ranked = sorted(enumerate(sims), key=lambda x: x[1], reverse=True)
     return ranked[:k]
 
-
-def analyze_failures(queries, qrels,ds_c, corpus_embs, k=TOP_K):
+def analyze_failures(queries,query_embs, qrels,ds_c, corpus_embs, k=TOP_K):
     for qi, q in enumerate(queries):
         print(f"\nQuery {qi}: {q}")
         top = retrieve_topk(query_embs[qi], corpus_embs, k)
@@ -205,9 +260,10 @@ def analyze_failures(queries, qrels,ds_c, corpus_embs, k=TOP_K):
             flag = '✔' if doc_id in gold else '✖'
             print(f"  {rank}. Doc {doc_id} (score: {score:.3f}) {flag}")
             img = ds_c[doc_id]["image"]
-            plt.figure(figsize=(4,4))
-            plt.imshow(img); plt.axis('off')
-        input("Press Enter for next query...")
+            plt.imshow(img)
+            plt.show()
+
+            print("-" * 20)
 
 # --- Main Script ---
 if __name__ == '__main__':
@@ -224,10 +280,12 @@ if __name__ == '__main__':
 
     
     # 2. Embed corpus
+     
     print("Embedding corpus...")
     all_passages_embs: List[Tensor] = []
     num_corpus_docs = len(ds_c)
-  
+    corpus_processing_batch_size = 16
+    
     print(f"\nEncoding pages...")
     for i in tqdm(range(0, num_corpus_docs, corpus_processing_batch_size), desc="Corpus Encoding Batches"):
         batch_start = i
@@ -235,7 +293,7 @@ if __name__ == '__main__':
             
         current_batch_dataset_slice = ds_c.select(range(batch_start, batch_end))
         current_batch_images: List[Image.Image] = [ex['image'] for ex in current_batch_dataset_slice]
-        all_passages_embs.append(forward_passages(current_batch_images))
+        all_passages_embs.extend(forward_passages(current_batch_images,8,True))
     
     
     # 3. Embed queries
