@@ -55,21 +55,137 @@ def extract_crops(image):
     return crops or [image]
 
 
-def embed_image(image):
-    # OCR text + vision
-    text = pytesseract.image_to_string(image)
-    text_emb = embed_texts([text])[0] if text.strip() else torch.zeros(text_model.config.hidden_size)
+def forward_passages(
+        passages: List[Image.Image],
+        batch_size: int,
+        pure: bool,
+        **kwargs,
+    ) -> List[torch.Tensor]:
+        
+        # Not Pure img text
+        # 1️⃣ OCR + embedding texte
+        if not pure : 
+            text_embs: List[torch.Tensor] = []
+            text_model.eval()
+            ocr_texts: List[str] = []
+            for page_img in tqdm(passages, desc="Performing OCR", leave=False, disable=len(passages)<5):
+                 try:
+                    ocr_texts.append(pytesseract.image_to_string(page_img))
+                 except Exception as e:
+                    print(f"Warning: Pytesseract OCR failed for a page: {e}. Using empty string.")
+                    ocr_texts.append("")
 
-    crops = extract_crops(image)
-    imgs = [c.convert('RGB') for c in crops]
-    proc = image_processor(images=imgs, return_tensors='pt').to(DEVICE)
-    with torch.no_grad():
-        out = vision_model(**proc)
-        vis_feats = out.last_hidden_state.mean(1)
-        vis_embs = F.normalize(F.layer_norm(vis_feats, vis_feats.shape[-1:]), p=2)
-    # combine text and all crops by max pooling
-    all_embs = torch.vstack([text_emb.unsqueeze(0), vis_embs.cpu()])
-    return all_embs
+            for text_batch in tqdm(
+                batched(ocr_texts, batch_size), 
+                desc="Embedding page texts", 
+                leave=False,
+                total= (len(ocr_texts) + batch_size -1) // batch_size,
+                disable=len(ocr_texts)<batch_size*2
+            ):
+                if not any(text_batch): 
+                    num_empty = len(list(text_batch))
+                    text_embs.extend([torch.zeros(text_model.config.hidden_size) for _ in range(num_empty)])
+                    continue
+
+                enc = tokenizer(
+                    list(text_batch), padding=True, truncation=True, return_tensors="pt", max_length=8192 # Nomic max length
+                ).to(device)
+                with torch.no_grad():
+                    out = text_model(**enc)
+                    pooled = _mean_pooling(out, enc["attention_mask"])
+                    pooled = F.layer_norm(pooled, normalized_shape=(pooled.shape[1],), eps=1e-7)
+                    pooled = F.normalize(pooled, p=2, dim=1)
+                text_embs.extend(torch.unbind(pooled.cpu(), dim=0))
+                del enc, out, pooled
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+
+
+        # Extraction des diagrammes/images (si pas pure) de tout (si pure) 
+        total_crops: List[List[Image.Image]] = []
+        vision_model.eval() 
+
+        for page in tqdm(passages, desc="Layout extracation page images", leave=False):
+            det = layout_model.predict(
+                page, imgsz=1024, conf=0.2, device=device
+            )
+            crops: List[Image.Image] = []
+            if det and len(det[0].boxes) > 0:
+                for box in det[0].boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2 = min(page.width, x2)
+                    y2 = min(page.height, y2)
+                    class_id = int(box.cls[0])
+                    class_name = layout_model.names[class_id]
+
+                    #En pure mode on prend chaque layout en image sinon que les diagrame
+                    if pure or class_name in ["figure","table"]:
+                        crops.append(page.crop((x1, y1, x2, y2)))
+                        plt.imshow(page.crop((x1, y1, x2, y2)))
+                        plt.show()
+
+            # Si pas de diagramme détecté, fallback sur la page entière
+            if len(crops) == 0:
+                crops = [page]
+            total_crops.append(crops)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+
+        #Image embeddings    
+        img_embs: List[List[torch.Tensor]] = [] # Stores list of embeddings for each page
+        for page_crops in tqdm(total_crops, desc="Embedding per page images", leave=False):
+            current_page_img_embs: List[torch.Tensor] = []
+            if not page_crops:
+                img_embs.append([])
+                continue
+
+            # Convert images to RGB if necessary for the processor
+            rgb_page_crops = [crop.convert("RGB") if crop.mode != "RGB" else crop for crop in page_crops]
+
+            # Process image crops and get embeddings
+            proc = image_processor(
+                images=rgb_page_crops, return_tensors="pt"
+            ).to(device)
+
+            with torch.no_grad():
+                out = vision_model(**proc)
+                # Mean pool over patches to get a single embedding per crop
+                feats = out.last_hidden_state.mean(dim=1)
+                feats = F.layer_norm(feats, (feats.shape[1],))
+                feats = F.normalize(feats, p=2, dim=1)
+
+            current_page_img_embs.extend(torch.unbind(feats.cpu(), dim=0)) # Unbind to get individual tensors
+            img_embs.append(current_page_img_embs) # Append the list of embeddings for the current page
+
+            del page_crops, rgb_page_crops, proc, out, feats
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        
+        final_page_embeddings: List[List[torch.Tensor]] = []
+        num_pages = len(passages)
+
+        if not pure:
+            if len(text_embs) != num_pages or len(img_embs) != num_pages:
+                print(f"Warning: Mismatch in number of text ({len(text_embs)}) and image ({len(img_embs)}) embedding lists. Expected {num_pages}.")
+
+            for i in range(num_pages):
+                current_page_combined_embs = []
+                # Add text embedding for the current page if available
+                if i < len(text_embs) and text_embs[i] is not None:
+                    current_page_combined_embs.append(text_embs[i])
+                # Add all image embeddings for the current page if available
+                if i < len(img_embs):
+                    current_page_combined_embs.extend(img_embs[i])
+                final_page_embeddings.append(current_page_combined_embs)
+        else:
+            # If in pure image mode, only return the image embeddings
+            final_page_embeddings = img_embs
+
+        return final_page_embeddings
 
 
 def retrieve_topk(query_emb, corpus_embs, k):
@@ -119,7 +235,7 @@ if __name__ == '__main__':
             
         current_batch_dataset_slice = ds_c.select(range(batch_start, batch_end))
         current_batch_images: List[Image.Image] = [ex['image'] for ex in current_batch_dataset_slice]
-        all_passages_embs.append(embed_image(current_batch_images))
+        all_passages_embs.append(forward_passages(current_batch_images))
     
     
     # 3. Embed queries
